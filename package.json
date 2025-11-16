@@ -1,0 +1,30 @@
+{
+  "name": "codeql-mcp-server",
+  "version": "1.0.0",
+  "description": "Model Context Protocol server for CodeQL analysis of large codebases",
+  "type": "module",
+  "bin": {
+    "codeql-mcp-server": "./build/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc --watch",
+    "prepare": "npm run build",
+    "start": "node build/index.js"
+  },
+  "keywords": [
+    "mcp",
+    "codeql",
+    "code-analysis",
+    "static-analysis"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  }
+}
