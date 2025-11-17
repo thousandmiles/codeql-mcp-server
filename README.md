@@ -159,14 +159,6 @@ The extraction queries are organized by language in `queries/export/<language>/`
 - `extract-classes.ql` - Extract class definitions
 - `extract-methods.ql` - Extract class-method relationships
 
-### Implementation Notes
-
-- Each language uses its own CodeQL library API (different types and methods)
-- JavaScript/TypeScript share the same queries in `javascript/` directory
-- Call graph extraction requires statically resolvable calls (limited for dynamic languages)
-- Anonymous functions get unique IDs via location (`file:line`)
-- **Contributing:** To add a new language, create queries in `queries/export/<language>/` following the JavaScript examples
-
 ## Scripts
 
 All utility scripts are in `./scripts/`:
