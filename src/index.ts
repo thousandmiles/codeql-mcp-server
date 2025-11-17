@@ -10,9 +10,16 @@ import {
 import { execFile, spawn } from "child_process";
 import { promisify } from "util";
 import { mkdir, readFile, writeFile, access, unlink } from "fs/promises";
-import { join } from "path";
+import { join, dirname } from "path";
 import { homedir } from "os";
 import { execSync } from "child_process";
+import { fileURLToPath } from "url";
+import * as postgres from "./postgres.js";
+
+// Get the directory of the current module
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+const PROJECT_ROOT = join(__dirname, "..");
 
 const execFileAsync = promisify(execFile);
 
@@ -341,7 +348,7 @@ class CodeQLMCPServer {
         },
         {
           name: "find_function",
-          description: "Find function definitions in the codebase with fuzzy name matching. Searches across all files and returns function locations, signatures, and containing files.",
+          description: "Find function definitions in the codebase with fuzzy name matching. Searches across all files and returns function locations, signatures, and containing files. NOTE: Slow. Use find_function_graph if graph index is built.",
           inputSchema: {
             type: "object",
             properties: {
@@ -359,6 +366,118 @@ class CodeQLMCPServer {
               },
             },
             required: ["database_name", "function_name"],
+          },
+        },
+        {
+          name: "build_graph_index",
+          description: "Build PostgreSQL graph index for fast queries. Extracts functions, calls, classes from CodeQL database. One-time operation, then queries are significantly faster.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              database_name: {
+                type: "string",
+                description: "Name of the CodeQL database to index",
+              },
+            },
+            required: ["database_name"],
+          },
+        },
+        {
+          name: "find_function_graph",
+          description: "Fast function search using graph index. Requires build_graph_index first.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              database_name: {
+                type: "string",
+                description: "Name of the database",
+              },
+              function_name: {
+                type: "string",
+                description: "Function name to search (fuzzy matching)",
+              },
+              limit: {
+                type: "number",
+                description: "Maximum results (default: 50)",
+              },
+            },
+            required: ["database_name", "function_name"],
+          },
+        },
+        {
+          name: "find_callers_graph",
+          description: "Find all functions that call a specific function using graph index.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              database_name: {
+                type: "string",
+                description: "Name of the database",
+              },
+              function_name: {
+                type: "string",
+                description: "Function to find callers of",
+              },
+            },
+            required: ["database_name", "function_name"],
+          },
+        },
+        {
+          name: "find_call_chain_graph",
+          description: "Find call chain path between two functions using graph index.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              database_name: {
+                type: "string",
+                description: "Name of the database",
+              },
+              from_function: {
+                type: "string",
+                description: "Starting function",
+              },
+              to_function: {
+                type: "string",
+                description: "Target function",
+              },
+              max_depth: {
+                type: "number",
+                description: "Maximum search depth (default: 5)",
+              },
+            },
+            required: ["database_name", "from_function", "to_function"],
+          },
+        },
+        {
+          name: "get_class_hierarchy_graph",
+          description: "Get class inheritance hierarchy with methods using graph index.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              database_name: {
+                type: "string",
+                description: "Name of the database",
+              },
+              class_name: {
+                type: "string",
+                description: "Class to get hierarchy for",
+              },
+            },
+            required: ["database_name", "class_name"],
+          },
+        },
+        {
+          name: "get_graph_stats",
+          description: "Get database statistics and hot spots using graph index.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              database_name: {
+                type: "string",
+                description: "Name of the database",
+              },
+            },
+            required: ["database_name"],
           },
         },
       ];
@@ -407,6 +526,18 @@ class CodeQLMCPServer {
             return await this.handleExportResults(args);
           case "find_function":
             return await this.handleFindFunction(args);
+          case "build_graph_index":
+            return await this.handleBuildGraphIndex(args);
+          case "find_function_graph":
+            return await this.handleFindFunctionFast(args);
+          case "find_callers_graph":
+            return await this.handleFindCallers(args);
+          case "find_call_chain_graph":
+            return await this.handleFindCallChain(args);
+          case "get_class_hierarchy_graph":
+            return await this.handleGetClassHierarchy(args);
+          case "get_graph_stats":
+            return await this.handleQueryGraphStats(args);
           default:
             return {
               content: [
@@ -1003,7 +1134,7 @@ select m, m.getName() as name, m.getFile().getRelativePath() as file,
       // Write query to file
       await writeFile(queryFile, query);
 
-      // Run the query and output BQRS
+      // Run the query and output BQRS with multi-threading
       const bqrsFile = join(queryDir, `results-${Date.now()}.bqrs`);
       await this.runCodeQL([
         "query",
@@ -1013,6 +1144,8 @@ select m, m.getName() as name, m.getFile().getRelativePath() as file,
         db.path,
         "--output",
         bqrsFile,
+        "--threads=0",  // Use all available CPU cores
+        "--ram=2048",   // Allocate more RAM for faster execution
       ]);
 
       // Decode BQRS to CSV
@@ -1085,6 +1218,460 @@ select m, m.getName() as name, m.getFile().getRelativePath() as file,
       throw new Error(
         `Failed to find functions: ${error.message}\n${error.stderr || ""}`
       );
+    }
+  }
+
+  private async handleBuildGraphIndex(args: any) {
+    const { database_name } = args;
+
+    const db = this.databases.get(database_name);
+    if (!db) {
+      throw new Error(`Database '${database_name}' not found`);
+    }
+
+    const startTime = Date.now();
+
+    try {
+      // Test PostgreSQL connection
+      const pgConnected = await postgres.testConnection();
+      if (!pgConnected) {
+        throw new Error("PostgreSQL connection failed. Run: ./scripts/setup-postgres.sh");
+      }
+
+      // Clear existing data for this database
+      console.error(`Clearing existing data for ${database_name}...`);
+      await postgres.clearDatabase(database_name);
+
+      const tempDir = join(CODEQL_DB_DIR, ".temp");
+      await mkdir(tempDir, { recursive: true });
+
+      // Language-specific query directory selection
+      const language = db.language;
+      let languageDir = "";
+      
+      // Map languages to query directories
+      if (language === "javascript" || language === "typescript") {
+        languageDir = "javascript";
+      } else if (language === "python") {
+        languageDir = "python";
+      } else if (language === "java") {
+        languageDir = "java";
+      } else if (language === "cpp" || language === "c") {
+        languageDir = "cpp";
+      } else if (language === "go") {
+        languageDir = "go";
+      } else if (language === "csharp") {
+        languageDir = "csharp";
+      } else if (language === "ruby") {
+        languageDir = "ruby";
+      } else {
+        throw new Error(`Unsupported language for graph indexing: ${language}`);
+      }
+
+      const queryDir = join(PROJECT_ROOT, "queries", "export", languageDir);
+
+      const extractions = [
+        { query: "extract-functions.ql", table: "functions", columns: ["codeql_id", "name", "file", "line", "num_params", "signature"], required: true },
+        { query: "extract-calls.ql", table: "function_calls", columns: ["caller_codeql_id", "callee_codeql_id", "file", "line"], required: false },
+        { query: "extract-classes.ql", table: "classes", columns: ["codeql_id", "name", "file", "line", "parent_codeql_id"], required: false },
+        { query: "extract-methods.ql", table: "class_methods", columns: ["class_codeql_id", "method_codeql_id", "method_name"], required: false },
+      ];
+
+      const stats: any = {};
+
+      for (const { query, table, columns, required } of extractions) {
+        console.error(`\nExtracting ${languageDir}/${query}...`);
+        
+        const queryFile = join(queryDir, query);
+        
+        // Check if query file exists, skip if not required
+        try {
+          await access(queryFile);
+        } catch {
+          if (required) {
+            throw new Error(`Required query file not found: ${queryFile}\n\nGraph indexing for ${language} requires extraction queries in queries/export/${languageDir}/`);
+          }
+          console.error(`  Skipping ${languageDir}/${query} (not found)`);
+          stats[table] = 0;
+          continue;
+        }
+        
+        const bqrsFile = join(tempDir, `${query}.bqrs`);
+        const csvFile = join(tempDir, `${query}.csv`);
+
+        // Run extraction query
+        await this.runCodeQL([
+          "query",
+          "run",
+          queryFile,
+          "--database",
+          db.path,
+          "--output",
+          bqrsFile,
+          "--threads=0",
+        ]);
+
+        // Decode to CSV
+        await execFileAsync(CODEQL_PATH, [
+          "bqrs",
+          "decode",
+          bqrsFile,
+          "--format=csv",
+          "--output",
+          csvFile,
+        ]);
+
+        // Import to PostgreSQL
+        console.error(`Importing to ${table}...`);
+        
+        // Add database_name column to CSV
+        const csvContent = await readFile(csvFile, "utf-8");
+        const lines = csvContent.trim().split("\n");
+        const dataLines = lines.slice(1); // Skip header
+        
+        // Build VALUES for batch insert
+        const insertColumns = ["database_name", ...columns];
+        const values: (string | null)[][] = [];
+        
+        for (const line of dataLines) {
+          if (line.trim()) {
+            const parts = line.split(",").map(v => {
+              v = v.trim().replace(/^"(.*)"$/, "$1");
+              // Convert empty strings to null for optional fields
+              return v === "" ? null : v;
+            });
+            values.push([database_name, ...parts]);
+          }
+        }
+
+        if (values.length > 0) {
+          // Batch insert
+          const placeholders = values.map((_, i) => 
+            `(${insertColumns.map((__, j) => `$${i * insertColumns.length + j + 1}`).join(", ")})`
+          ).join(", ");
+          
+          const flatValues = values.flat();
+          
+          await postgres.executeQuery(
+            `INSERT INTO ${table} (${insertColumns.join(", ")}) VALUES ${placeholders}`,
+            flatValues
+          );
+        }
+
+        stats[table] = values.length;
+
+        // Cleanup temp files
+        try {
+          await unlink(bqrsFile);
+          await unlink(csvFile);
+        } catch {}
+      }
+
+      // Update foreign key references
+      console.error("\nUpdating relationships...");
+      await postgres.updateForeignKeys(database_name);
+
+      const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `✓ Graph index built successfully in ${elapsed}s\n\n` +
+                  `Statistics:\n` +
+                  `  Functions: ${stats.functions || 0}\n` +
+                  `  Classes: ${stats.classes || 0}\n` +
+                  `  Function calls: ${stats.function_calls || 0}\n` +
+                  `  Class methods: ${stats.class_methods || 0}\n\n` +
+                  `Fast queries now available:\n` +
+                  `  - find_function_graph\n` +
+                  `  - find_callers_graph\n` +
+                  `  - find_call_chain_graph\n` +
+                  `  - get_class_hierarchy_graph\n` +
+                  `  - get_graph_stats`,
+          },
+        ],
+      };
+    } catch (error: any) {
+      throw new Error(`Failed to build graph index: ${error.message}`);
+    }
+  }
+
+  private async handleFindFunctionFast(args: any) {
+    const { database_name, function_name, limit = 50 } = args;
+
+    try {
+      const result = await postgres.executeQuery(
+        `SELECT name, file, line, num_params, signature
+         FROM functions
+         WHERE database_name = $1
+           AND name % $2
+         ORDER BY similarity(name, $2) DESC, name
+         LIMIT $3`,
+        [database_name, function_name, limit]
+      );
+
+      if (result.rows.length === 0) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `No functions found matching '${function_name}'`,
+            },
+          ],
+        };
+      }
+
+      let output = `Found ${result.rows.length} function(s) matching '${function_name}':\n\n`;
+      
+      for (const row of result.rows) {
+        output += `📍 ${row.name}(${row.num_params} params) - ${row.file}:${row.line}\n`;
+      }
+
+      return {
+        content: [{ type: "text", text: output }],
+      };
+    } catch (error: any) {
+      if (error.message.includes("relation") && error.message.includes("does not exist")) {
+        throw new Error("Graph index not built. Run: build_graph_index " + database_name);
+      }
+      throw error;
+    }
+  }
+
+  private async handleFindCallers(args: any) {
+    const { database_name, function_name } = args;
+
+    try {
+      const result = await postgres.executeQuery(
+        `SELECT 
+           caller.name as caller_name,
+           caller.file as caller_file,
+           fc.line as call_line,
+           COUNT(*) OVER (PARTITION BY caller.id) as call_count
+         FROM function_calls fc
+         JOIN functions caller ON caller.id = fc.caller_id
+         JOIN functions callee ON callee.id = fc.callee_id
+         WHERE callee.name = $1 AND callee.database_name = $2
+         ORDER BY caller.file, fc.line
+         LIMIT 200`,
+        [function_name, database_name]
+      );
+
+      if (result.rows.length === 0) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `No callers found for function '${function_name}'`,
+            },
+          ],
+        };
+      }
+
+      let output = `Found ${result.rows.length} call site(s) for '${function_name}':\n\n`;
+      
+      for (const row of result.rows) {
+        output += `📞 ${row.caller_name}() calls it at ${row.caller_file}:${row.call_line}\n`;
+      }
+
+      return {
+        content: [{ type: "text", text: output }],
+      };
+    } catch (error: any) {
+      if (error.message.includes("relation") && error.message.includes("does not exist")) {
+        throw new Error("Graph index not built. Run: build_graph_index " + database_name);
+      }
+      throw error;
+    }
+  }
+
+  private async handleFindCallChain(args: any) {
+    const { database_name, from_function, to_function, max_depth = 5 } = args;
+
+    try {
+      const result = await postgres.executeQuery(
+        `WITH RECURSIVE call_chain AS (
+           SELECT 
+             f.id,
+             f.name,
+             f.file,
+             ARRAY[f.name] as path,
+             0 as depth
+           FROM functions f
+           WHERE f.name = $1 AND f.database_name = $3
+           
+           UNION ALL
+           
+           SELECT 
+             callee.id,
+             callee.name,
+             callee.file,
+             cc.path || callee.name,
+             cc.depth + 1
+           FROM call_chain cc
+           JOIN function_calls fc ON fc.caller_id = cc.id
+           JOIN functions callee ON callee.id = fc.callee_id
+           WHERE cc.depth < $4
+             AND NOT callee.name = ANY(cc.path)
+         )
+         SELECT path, depth, file
+         FROM call_chain
+         WHERE name = $2
+         ORDER BY depth
+         LIMIT 1`,
+        [from_function, to_function, database_name, max_depth]
+      );
+
+      if (result.rows.length === 0) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `No call chain found from '${from_function}' to '${to_function}' within depth ${max_depth}`,
+            },
+          ],
+        };
+      }
+
+      const row = result.rows[0];
+      const path = row.path.join(" → ");
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Call chain found (depth ${row.depth}):\n\n${path}`,
+          },
+        ],
+      };
+    } catch (error: any) {
+      if (error.message.includes("relation") && error.message.includes("does not exist")) {
+        throw new Error("Graph index not built. Run: build_graph_index " + database_name);
+      }
+      throw error;
+    }
+  }
+
+  private async handleGetClassHierarchy(args: any) {
+    const { database_name, class_name } = args;
+
+    try {
+      // Get class and its ancestors
+      const hierarchyResult = await postgres.executeQuery(
+        `WITH RECURSIVE class_hierarchy AS (
+           SELECT c.id, c.name, c.file, c.line, c.parent_id, 0 as level
+           FROM classes c
+           WHERE c.name = $1 AND c.database_name = $2
+           
+           UNION ALL
+           
+           SELECT c.id, c.name, c.file, c.line, c.parent_id, ch.level + 1
+           FROM class_hierarchy ch
+           JOIN classes c ON c.id = ch.parent_id
+           WHERE ch.level < 10
+         )
+         SELECT * FROM class_hierarchy ORDER BY level DESC`,
+        [class_name, database_name]
+      );
+
+      if (hierarchyResult.rows.length === 0) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Class '${class_name}' not found`,
+            },
+          ],
+        };
+      }
+
+      // Get methods for each class in hierarchy
+      const classIds = hierarchyResult.rows.map(r => r.id);
+      const methodsResult = await postgres.executeQuery(
+        `SELECT c.name as class_name, f.name as method_name, f.line
+         FROM class_methods cm
+         JOIN classes c ON c.id = cm.class_id
+         JOIN functions f ON f.id = cm.method_id
+         WHERE c.id = ANY($1)
+         ORDER BY c.name, f.name`,
+        [classIds]
+      );
+
+      const methodsByClass: { [key: string]: string[] } = {};
+      for (const row of methodsResult.rows) {
+        if (!methodsByClass[row.class_name]) {
+          methodsByClass[row.class_name] = [];
+        }
+        methodsByClass[row.class_name].push(row.method_name);
+      }
+
+      let output = `Class hierarchy for '${class_name}':\n\n`;
+      
+      for (const row of hierarchyResult.rows) {
+        const indent = "  ".repeat(hierarchyResult.rows.length - row.level - 1);
+        const methods = methodsByClass[row.name] || [];
+        const methodList = methods.length > 0 ? ` [${methods.slice(0, 5).join(", ")}${methods.length > 5 ? "..." : ""}]` : "";
+        output += `${indent}${row.name} (${row.file}:${row.line})${methodList}\n`;
+      }
+
+      return {
+        content: [{ type: "text", text: output }],
+      };
+    } catch (error: any) {
+      if (error.message.includes("relation") && error.message.includes("does not exist")) {
+        throw new Error("Graph index not built. Run: build_graph_index " + database_name);
+      }
+      throw error;
+    }
+  }
+
+  private async handleQueryGraphStats(args: any) {
+    const { database_name } = args;
+
+    try {
+      const stats = await postgres.getDatabaseStats(database_name);
+
+      // Get top 10 most called functions
+      const hotSpotsResult = await postgres.executeQuery(
+        `SELECT 
+           f.name,
+           f.file,
+           COUNT(fc.id) as call_count,
+           COUNT(DISTINCT fc.caller_id) as unique_callers
+         FROM functions f
+         JOIN function_calls fc ON fc.callee_id = f.id
+         WHERE f.database_name = $1
+         GROUP BY f.id, f.name, f.file
+         HAVING COUNT(fc.id) > 1
+         ORDER BY call_count DESC
+         LIMIT 10`,
+        [database_name]
+      );
+
+      let output = `Graph Database Statistics for '${database_name}':\n\n`;
+      output += `Total entities:\n`;
+      output += `  Functions: ${stats.functions}\n`;
+      output += `  Classes: ${stats.classes}\n`;
+      output += `  Function calls: ${stats.calls}\n`;
+      output += `  Class methods: ${stats.methods}\n`;
+      output += `  Variables: ${stats.variables}\n\n`;
+
+      if (hotSpotsResult.rows.length > 0) {
+        output += `Top 10 most-called functions (hot spots):\n`;
+        for (const row of hotSpotsResult.rows) {
+          output += `  🔥 ${row.name}() - ${row.call_count} calls from ${row.unique_callers} callers\n`;
+        }
+      }
+
+      return {
+        content: [{ type: "text", text: output }],
+      };
+    } catch (error: any) {
+      if (error.message.includes("relation") && error.message.includes("does not exist")) {
+        throw new Error("Graph index not built. Run: build_graph_index " + database_name);
+      }
+      throw error;
     }
   }
 
