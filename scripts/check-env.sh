@@ -68,6 +68,25 @@ else
 fi
 echo ""
 
+# Check PostgreSQL
+echo "Checking PostgreSQL..."
+if command -v psql &> /dev/null; then
+    PSQL_VERSION=$(psql --version | head -1)
+    echo "✅ PostgreSQL found: $PSQL_VERSION"
+    
+    # Test connection to codeql_graph database
+    if PGPASSWORD=codeql123 psql -h localhost -U codeql -d codeql_graph -c "SELECT 1;" &> /dev/null; then
+        echo "✅ PostgreSQL connection successful"
+    else
+        echo "⚠️  Cannot connect to codeql_graph database"
+        echo "   Run: ./scripts/setup-postgres.sh"
+    fi
+else
+    echo "⚠️  PostgreSQL not found (optional for graph index features)"
+    echo "   For 100x faster queries, run: ./scripts/setup-postgres.sh"
+fi
+echo ""
+
 # Summary
 echo "Environment check complete!"
 

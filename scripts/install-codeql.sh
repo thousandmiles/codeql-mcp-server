@@ -14,10 +14,10 @@ case "${OS}" in
     *)          echo "❌ Unsupported OS: ${OS}"; exit 1;;
 esac
 
-CODEQL_VERSION="2.15.3"
+CODEQL_VERSION="2.23.5"
 INSTALL_DIR="$HOME/codeql"
 CODEQL_REPO="$HOME/codeql-home"
-PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # Install CodeQL CLI
 echo "[1/5] Installing CodeQL CLI..."
@@ -60,14 +60,23 @@ export CODEQL_HOME="$HOME/codeql-home"
 
 # Install dependencies
 echo ""
-echo "[4/5] Installing dependencies..."
-cd "$PROJECT_DIR"
+echo "[4/6] Installing dependencies..."
+cd "$PROJECT_ROOT"
 npm install --silent
 
 # Build
 echo ""
-echo "[5/5] Building project..."
+echo "[5/6] Building project..."
 npm run build
+
+# Install query pack dependencies
+echo ""
+echo "[6/6] Installing CodeQL query pack dependencies..."
+cd "$PROJECT_ROOT/queries/export/javascript"
+codeql pack install --silent 2>/dev/null || codeql pack install
+cd "$PROJECT_ROOT/queries/export/python"
+codeql pack install --silent 2>/dev/null || codeql pack install
+echo "✓ Query packs installed"
 
 echo ""
 echo "✓ Setup complete!"
