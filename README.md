@@ -123,9 +123,24 @@ Connection string: `postgresql://codeql:codeql123@localhost/codeql_graph`
 
 ## Testing
 
+### Interactive Testing
+
 ```bash
 npx @modelcontextprotocol/inspector $(which node) build/index.js
 ```
+
+### Automated Tests
+
+```bash
+# Run all tests
+./tests/test-all.sh
+
+# Or run individual language tests
+./tests/javascript/test-rocketchat.sh  # JavaScript/TypeScript (Rocket.Chat)
+./tests/python/test-flask.sh           # Python (Flask)
+```
+
+See [tests/README.md](tests/README.md) for details.
 
 ## Architecture
 
@@ -143,14 +158,14 @@ MCP Tools (100-600x faster with index)
 
 The extraction queries are organized by language in `queries/export/<language>/`:
 
-| Language              | Core Analysis | Graph Index | Query Directory                                  | Status                         |
-| --------------------- | ------------- | ----------- | ------------------------------------------------ | ------------------------------ |
-| JavaScript/TypeScript | ✅            | ⚠️          | `queries/export/javascript/`                     | Queries created, needs testing |
-| Python                | ✅            | ⚠️          | `queries/export/python/`                         | Queries created, needs testing |
-| Java                  | ✅            | ❌          | `queries/export/java/`                           | Not yet implemented            |
-| C/C++                 | ✅            | ❌          | `queries/export/cpp/`                            | Not yet implemented            |
-| Go                    | ✅            | ❌          | `queries/export/go/`                             | Not yet implemented            |
-| C#/Ruby               | ✅            | ❌          | `queries/export/csharp/`, `queries/export/ruby/` | Not yet implemented            |
+| Language              | Core Analysis | Graph Index | Query Directory                                  | Status   |
+| --------------------- | ------------- | ----------- | ------------------------------------------------ | -------- |
+| JavaScript/TypeScript | ✅            | ✅          | `queries/export/javascript/`                     | Tested ✓ |
+| Python                | ✅            | ✅          | `queries/export/python/`                         | Tested ✓ |
+| Java                  | ✅            | ❌          | `queries/export/java/`                           | Planned  |
+| C/C++                 | ✅            | ❌          | `queries/export/cpp/`                            | Planned  |
+| Go                    | ✅            | ❌          | `queries/export/go/`                             | Planned  |
+| C#/Ruby               | ✅            | ❌          | `queries/export/csharp/`, `queries/export/ruby/` | Planned  |
 
 **Each language directory should contain:**
 

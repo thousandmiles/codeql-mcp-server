@@ -7,14 +7,35 @@
 
 import python
 
-from Call call, Function caller, Function callee
+from Call call, Function caller, string callee_codeql_id
 where
   caller = call.getScope() and
-  callee = call.getFunc().(Name).getVariable().getAStore().getScope() and
-  exists(caller.getName()) and
-  exists(callee.getName())
-select caller.toString() + "@" + caller.getLocation().getFile().getRelativePath() + ":" +
-    caller.getLocation().getStartLine().toString() as caller_codeql_id,
-  callee.toString() + "@" + callee.getLocation().getFile().getRelativePath() + ":" +
-    callee.getLocation().getStartLine().toString() as callee_codeql_id,
+  (
+    // Call via Name (e.g., func_name())
+    exists(string funcName |
+      funcName = call.getFunc().(Name).getId() and
+      callee_codeql_id =
+        "unresolved:" + funcName + "@" + call.getLocation().getFile().getRelativePath() + ":" +
+          call.getLocation().getStartLine().toString()
+    )
+    or
+    // Call via Attribute (e.g., obj.method())
+    exists(string attrName |
+      attrName = call.getFunc().(Attribute).getName() and
+      callee_codeql_id =
+        "unresolved:" + attrName + "@" + call.getLocation().getFile().getRelativePath() + ":" +
+          call.getLocation().getStartLine().toString()
+    )
+    or
+    // Other calls (fallback)
+    not exists(call.getFunc().(Name)) and
+    not exists(call.getFunc().(Attribute)) and
+    callee_codeql_id =
+      "unresolved:unknown@" + call.getLocation().getFile().getRelativePath() + ":" +
+        call.getLocation().getStartLine().toString()
+  )
+select caller.getName() + "@" + caller.toString() + "@" +
+    caller.getLocation().getFile().getRelativePath() + ":" +
+    caller.getLocation().getStartLine().toString() + ":" +
+    caller.getLocation().getStartColumn().toString() as caller_codeql_id, callee_codeql_id,
   call.getLocation().getFile().getRelativePath() as file, call.getLocation().getStartLine() as line

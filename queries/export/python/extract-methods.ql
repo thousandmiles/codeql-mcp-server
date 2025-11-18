@@ -9,7 +9,8 @@ import python
 
 from Class c, Function m
 where m = c.getAMethod() and exists(c.getName()) and exists(m.getName())
-select c.toString() + "@" + c.getLocation().getFile().getRelativePath() + ":" +
-    c.getLocation().getStartLine().toString() as class_codeql_id,
-  m.toString() + "@" + m.getLocation().getFile().getRelativePath() + ":" +
-    m.getLocation().getStartLine().toString() as method_codeql_id, m.getName() as method_name
+select c.getName() + "@" + c.toString() + "@" + c.getLocation().getFile().getRelativePath() + ":" +
+    c.getLocation().getStartLine().toString() + ":" + c.getLocation().getStartColumn().toString() as class_codeql_id,
+  m.getName() + "@" + m.toString() + "@" + m.getLocation().getFile().getRelativePath() + ":" +
+    m.getLocation().getStartLine().toString() + ":" + m.getLocation().getStartColumn().toString() as method_codeql_id,
+  m.getName() as method_name

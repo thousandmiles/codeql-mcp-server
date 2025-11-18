@@ -9,7 +9,8 @@ import python
 
 from Function f
 where exists(f.getName())
-select f.toString() + "@" + f.getLocation().getFile().getRelativePath() + ":" +
-    f.getLocation().getStartLine().toString() as codeql_id, f.getName() as name,
-  f.getLocation().getFile().getRelativePath() as file, f.getLocation().getStartLine() as line,
-  f.getPositionalParameterCount() as num_params, f.toString() as signature
+select f.getName() + "@" + f.toString() + "@" + f.getLocation().getFile().getRelativePath() + ":" +
+    f.getLocation().getStartLine().toString() + ":" + f.getLocation().getStartColumn().toString() as codeql_id,
+  f.getName() as name, f.getLocation().getFile().getRelativePath() as file,
+  f.getLocation().getStartLine() as line, f.getPositionalParameterCount() as num_params,
+  f.toString() as signature

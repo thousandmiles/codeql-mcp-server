@@ -1,0 +1,211 @@
+#!/bin/bash
+# Test script for Flask call graph indexing
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(dirname "$(dirname "$SCRIPT_DIR")")"
+DB_NAME="flask-test"
+TEST_PROJECT="$PROJECT_ROOT/test-projects/flask-test"
+
+echo "🧪 Testing Flask Call Graph Indexing"
+echo "====================================="
+echo ""
+
+# Check if test project exists
+if [ ! -d "$TEST_PROJECT" ]; then
+    echo "📥 Cloning Flask test project..."
+    mkdir -p "$PROJECT_ROOT/test-projects"
+    git clone --depth 1 https://github.com/pallets/flask.git "$TEST_PROJECT"
+fi
+
+# Check if CodeQL database exists
+DB_EXISTS=false
+if [ -d "$HOME/.codeql-mcp/databases/$DB_NAME" ]; then
+    DB_EXISTS=true
+    echo "✓ Database already exists"
+else
+    echo "🔨 Creating CodeQL database for Flask..."
+    codeql database create "$HOME/.codeql-mcp/databases/$DB_NAME" \
+        --source-root="$TEST_PROJECT" \
+        --language=python \
+        --overwrite
+    echo "✓ Database created"
+    DB_EXISTS=true
+fi
+
+# Always ensure database is registered in MCP server's index
+echo "📝 Registering database in MCP index..."
+INDEX_FILE="$HOME/.codeql-mcp/databases/index.json"
+TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z")
+
+if [ ! -f "$INDEX_FILE" ]; then
+    echo "[]" > "$INDEX_FILE"
+fi
+
+# Register using Python
+python3 << PYTHON_EOF
+import json
+index_file = "$INDEX_FILE"
+try:
+    with open(index_file, 'r') as f:
+        data = json.load(f)
+except:
+    data = []
+
+# Remove existing entry if present
+data = [db for db in data if db.get('name') != '$DB_NAME']
+
+# Add new entry
+data.append({
+    'name': '$DB_NAME',
+    'language': 'python',
+    'path': '$HOME/.codeql-mcp/databases/$DB_NAME',
+    'created': '$TIMESTAMP'
+})
+
+with open(index_file, 'w') as f:
+    json.dump(data, f, indent=2)
+PYTHON_EOF
+echo "✓ Database registered"
+echo ""
+
+# Build the MCP server
+echo "🔧 Building MCP server..."
+npm run build > /dev/null 2>&1
+echo "✓ Build complete"
+echo ""
+
+# Clean existing data
+echo "🧹 Cleaning existing graph data..."
+PGPASSWORD=codeql123 psql -h localhost -U codeql -d codeql_graph -c \
+    "DELETE FROM function_calls WHERE database_name = '$DB_NAME'; 
+     DELETE FROM class_methods WHERE database_name = '$DB_NAME';
+     DELETE FROM functions WHERE database_name = '$DB_NAME';
+     DELETE FROM classes WHERE database_name = '$DB_NAME';
+     DELETE FROM variables WHERE database_name = '$DB_NAME';" > /dev/null 2>&1
+if [ $? -eq 0 ]; then
+    echo "✓ Cleaned"
+else
+    echo "⚠ Warning: Could not clean existing data (continuing anyway)"
+fi
+echo ""
+
+# Create test client
+cat > "$PROJECT_ROOT/test-client.cjs" << 'EOF'
+const { spawn } = require('child_process');
+
+const dbName = process.argv[2] || 'flask-test';
+
+const server = spawn('node', ['build/index.js'], {
+  stdio: ['pipe', 'pipe', 'inherit'],
+  env: { ...process.env, PGPASSWORD: 'codeql123' },
+  cwd: __dirname
+});
+
+let buffer = '';
+let requestId = 0;
+
+server.stdout.on('data', (data) => {
+  buffer += data.toString();
+  const lines = buffer.split('\n');
+  buffer = lines.pop();
+  
+  lines.forEach(line => {
+    if (line.trim() && !line.includes('CodeQL MCP server')) {
+      try {
+        const msg = JSON.parse(line);
+        if (msg.result) {
+          console.log(msg.result.content[0].text);
+        } else if (msg.error) {
+          console.error('Error:', msg.error);
+        }
+      } catch (e) {}
+    }
+  });
+});
+
+function sendRequest(method, params) {
+  return new Promise((resolve) => {
+    const request = {
+      jsonrpc: '2.0',
+      id: ++requestId,
+      method: method,
+      params: params
+    };
+    server.stdin.write(JSON.stringify(request) + '\n');
+    setTimeout(resolve, 500);
+  });
+}
+
+async function runTests() {
+  await new Promise(r => setTimeout(r, 1000));
+  
+  console.log('📊 Test 1/6: Building graph index...\n');
+  await sendRequest('tools/call', {
+    name: 'build_graph_index',
+    arguments: { database_name: dbName }
+  });
+  await new Promise(r => setTimeout(r, 20000));
+  
+  console.log('\n📈 Test 2/6: Getting database statistics...\n');
+  await sendRequest('tools/call', {
+    name: 'get_graph_stats',
+    arguments: { database_name: dbName }
+  });
+  await new Promise(r => setTimeout(r, 2000));
+  
+  console.log('\n🔍 Test 3/6: Finding functions matching "request"...\n');
+  await sendRequest('tools/call', {
+    name: 'find_function_graph',
+    arguments: { database_name: dbName, function_name: 'request', limit: 10 }
+  });
+  await new Promise(r => setTimeout(r, 2000));
+  
+  console.log('\n📞 Test 4/6: Finding callers of "make_response"...\n');
+  await sendRequest('tools/call', {
+    name: 'find_callers_graph',
+    arguments: { database_name: dbName, function_name: 'make_response' }
+  });
+  await new Promise(r => setTimeout(r, 2000));
+  
+  console.log('\n🎯 Test 5/6: Finding call chain from "__init__" to "run"...\n');
+  await sendRequest('tools/call', {
+    name: 'find_call_chain_graph',
+    arguments: {
+      database_name: dbName,
+      from_function: '__init__',
+      to_function: 'run',
+      max_depth: 5
+    }
+  });
+  await new Promise(r => setTimeout(r, 2000));
+  
+  console.log('\n🏛️ Test 6/6: Finding functions with "app" in the name...\n');
+  await sendRequest('tools/call', {
+    name: 'find_function_graph',
+    arguments: {
+      database_name: dbName,
+      function_name: 'app',
+      limit: 15
+    }
+  });
+  await new Promise(r => setTimeout(r, 2000));
+  
+  server.kill();
+}
+
+runTests();
+EOF
+
+# Run tests
+echo "🚀 Running tests..."
+echo ""
+cd "$PROJECT_ROOT" && node test-client.cjs "$DB_NAME"
+
+# Cleanup temporary files
+rm -f "$PROJECT_ROOT/test-client.cjs"
+rm -f "$PROJECT_ROOT"/*.cjs
+
+echo ""
+echo "✅ Flask tests complete!"

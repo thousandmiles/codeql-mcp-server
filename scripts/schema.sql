@@ -45,6 +45,7 @@ CREATE TABLE function_calls (
     callee_codeql_id TEXT NOT NULL,
     caller_id INTEGER REFERENCES functions(id) ON DELETE CASCADE,
     callee_id INTEGER REFERENCES functions(id) ON DELETE CASCADE,
+    callee_name TEXT,  -- Store function name even if unresolved
     file TEXT NOT NULL,
     line INTEGER NOT NULL,
     created_at TIMESTAMP DEFAULT NOW()
@@ -96,6 +97,7 @@ CREATE INDEX idx_calls_callee ON function_calls(callee_id);  -- Find who calls a
 CREATE INDEX idx_calls_db ON function_calls(database_name);
 CREATE INDEX idx_calls_caller_codeql ON function_calls(caller_codeql_id);
 CREATE INDEX idx_calls_callee_codeql ON function_calls(callee_codeql_id);
+CREATE INDEX idx_calls_callee_name ON function_calls(callee_name);  -- Lookup unresolved calls by name
 
 -- Class methods
 CREATE INDEX idx_class_methods_class ON class_methods(class_id);

@@ -1272,14 +1272,27 @@ select m, m.getName() as name, m.getFile().getRelativePath() as file,
 
       const extractions = [
         { query: "extract-functions.ql", table: "functions", columns: ["codeql_id", "name", "file", "line", "num_params", "signature"], required: true },
-        { query: "extract-calls.ql", table: "function_calls", columns: ["caller_codeql_id", "callee_codeql_id", "file", "line"], required: false },
+        { query: "extract-calls.ql", table: "function_calls", columns: ["caller_codeql_id", "callee_codeql_id", "file", "line"], required: false, processRow: (parts: (string | null)[]) => {
+          // Extract callee_name from callee_codeql_id for better indexing
+          // Format: "unresolved:functionName@file:line" or "Function@file:line"
+          const calleeId = parts[1];
+          let calleeName: string | null = null;
+          if (calleeId?.startsWith("unresolved:")) {
+            const match = calleeId.match(/^unresolved:([^@]+)@/);
+            calleeName = match ? match[1] : null;
+          } else if (calleeId) {
+            const match = calleeId.match(/^([^@]+)@/);
+            calleeName = match ? match[1] : null;
+          }
+          return [...parts, calleeName];
+        }},
         { query: "extract-classes.ql", table: "classes", columns: ["codeql_id", "name", "file", "line", "parent_codeql_id"], required: false },
         { query: "extract-methods.ql", table: "class_methods", columns: ["class_codeql_id", "method_codeql_id", "method_name"], required: false },
       ];
 
       const stats: any = {};
 
-      for (const { query, table, columns, required } of extractions) {
+      for (const { query, table, columns, required, processRow } of extractions) {
         console.error(`\nExtracting ${languageDir}/${query}...`);
         
         const queryFile = join(queryDir, query);
@@ -1330,32 +1343,98 @@ select m, m.getName() as name, m.getFile().getRelativePath() as file,
         const dataLines = lines.slice(1); // Skip header
         
         // Build VALUES for batch insert
-        const insertColumns = ["database_name", ...columns];
+        // Include callee_name for function_calls if processRow is defined
+        const actualColumns = processRow ? ["database_name", ...columns, "callee_name"] : ["database_name", ...columns];
         const values: (string | null)[][] = [];
+        
+        // Simple CSV parser that handles quoted fields with commas
+        function parseCSVLine(line: string): string[] {
+          const result: string[] = [];
+          let current = "";
+          let inQuotes = false;
+          
+          for (let i = 0; i < line.length; i++) {
+            const char = line[i];
+            const nextChar = line[i + 1];
+            
+            if (char === '"' && !inQuotes) {
+              inQuotes = true;
+            } else if (char === '"' && inQuotes && nextChar === '"') {
+              current += '"';
+              i++; // Skip next quote
+            } else if (char === '"' && inQuotes) {
+              inQuotes = false;
+            } else if (char === ',' && !inQuotes) {
+              result.push(current);
+              current = "";
+            } else {
+              current += char;
+            }
+          }
+          result.push(current); // Add last field
+          return result;
+        }
+        
+        const seenIds = new Set<string>(); // Track unique IDs
+        let skippedDuplicates = 0;
         
         for (const line of dataLines) {
           if (line.trim()) {
-            const parts = line.split(",").map(v => {
-              v = v.trim().replace(/^"(.*)"$/, "$1");
+            const parts = parseCSVLine(line).map(v => {
+              v = v.trim();
               // Convert empty strings to null for optional fields
               return v === "" ? null : v;
             });
-            values.push([database_name, ...parts]);
+            
+            // Check for duplicates (first column is the unique ID after database_name)
+            const uniqueId = parts[0];
+            if (uniqueId && seenIds.has(uniqueId)) {
+              skippedDuplicates++;
+              continue; // Skip this duplicate
+            }
+            if (uniqueId) {
+              seenIds.add(uniqueId);
+            }
+            
+            // Apply row processor if defined (e.g., to extract callee_name)
+            const rowData = processRow ? processRow(parts) : parts;
+            const row = [database_name, ...rowData];
+            
+            values.push(row);
           }
         }
 
+        if (skippedDuplicates > 0) {
+          console.error(`⚠ Skipped ${skippedDuplicates} duplicate entries`);
+        }
+
         if (values.length > 0) {
-          // Batch insert
-          const placeholders = values.map((_, i) => 
-            `(${insertColumns.map((__, j) => `$${i * insertColumns.length + j + 1}`).join(", ")})`
-          ).join(", ");
+          // Batch insert with limit to avoid PostgreSQL parameter limit (65535)
+          // Be conservative: use 8000 params max per batch to be safe
+          const maxParams = 8000;
+          const batchSize = Math.floor(maxParams / actualColumns.length);
           
-          const flatValues = values.flat();
+          console.error(`Inserting ${values.length} rows (${actualColumns.length} columns each) in batches of ${batchSize}...`);
           
-          await postgres.executeQuery(
-            `INSERT INTO ${table} (${insertColumns.join(", ")}) VALUES ${placeholders}`,
-            flatValues
-          );
+          for (let i = 0; i < values.length; i += batchSize) {
+            const batch = values.slice(i, i + batchSize);
+            const placeholders = batch.map((_, batchIdx) => 
+              `(${actualColumns.map((__, j) => `$${batchIdx * actualColumns.length + j + 1}`).join(", ")})`
+            ).join(", ");
+            
+            const flatValues = batch.flat();
+            const expectedParams = batch.length * actualColumns.length;
+            
+            if (flatValues.length !== expectedParams) {
+              console.error(`WARNING: Mismatch! flatValues.length=${flatValues.length}, expected=${expectedParams}`);
+            }
+            
+            await postgres.executeQuery(
+              `INSERT INTO ${table} (${actualColumns.join(", ")}) VALUES ${placeholders}`,
+              flatValues
+            );
+            console.error(`  ✓ Batch ${Math.floor(i/batchSize) + 1}/${Math.ceil(values.length/batchSize)}: ${batch.length} rows, ${flatValues.length} params`);
+          }
         }
 
         stats[table] = values.length;
@@ -1443,16 +1522,18 @@ select m, m.getName() as name, m.getFile().getRelativePath() as file,
     const { database_name, function_name } = args;
 
     try {
+      // Find callers both through resolved function references AND unresolved call names
       const result = await postgres.executeQuery(
         `SELECT 
            caller.name as caller_name,
            caller.file as caller_file,
            fc.line as call_line,
-           COUNT(*) OVER (PARTITION BY caller.id) as call_count
+           CASE WHEN fc.callee_id IS NOT NULL THEN 'resolved' ELSE 'unresolved' END as call_type
          FROM function_calls fc
          JOIN functions caller ON caller.id = fc.caller_id
-         JOIN functions callee ON callee.id = fc.callee_id
-         WHERE callee.name = $1 AND callee.database_name = $2
+         LEFT JOIN functions callee ON callee.id = fc.callee_id
+         WHERE (callee.name = $1 OR fc.callee_name = $1)
+           AND fc.database_name = $2
          ORDER BY caller.file, fc.line
          LIMIT 200`,
         [function_name, database_name]
@@ -1472,7 +1553,8 @@ select m, m.getName() as name, m.getFile().getRelativePath() as file,
       let output = `Found ${result.rows.length} call site(s) for '${function_name}':\n\n`;
       
       for (const row of result.rows) {
-        output += `📞 ${row.caller_name}() calls it at ${row.caller_file}:${row.call_line}\n`;
+        const indicator = row.call_type === 'resolved' ? '📞' : '🔗';
+        output += `${indicator} ${row.caller_name}() calls it at ${row.caller_file}:${row.call_line}\n`;
       }
 
       return {
@@ -1511,8 +1593,12 @@ select m, m.getName() as name, m.getFile().getRelativePath() as file,
              cc.depth + 1
            FROM call_chain cc
            JOIN function_calls fc ON fc.caller_id = cc.id
-           JOIN functions callee ON callee.id = fc.callee_id
-           WHERE cc.depth < $4
+           LEFT JOIN functions callee ON (
+             callee.id = fc.callee_id OR 
+             callee.name = fc.callee_name
+           )
+           WHERE callee.database_name = $3
+             AND cc.depth < $4
              AND NOT callee.name = ANY(cc.path)
          )
          SELECT path, depth, file
