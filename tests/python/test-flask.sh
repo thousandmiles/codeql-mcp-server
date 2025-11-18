@@ -206,9 +206,13 @@ async function runTests() {
   });
   
   server.kill();
+  process.exit(0);
 }
 
-runTests();
+runTests().catch(err => {
+  console.error('Test failed:', err);
+  process.exit(1);
+});
 EOF
 
 # Run tests
