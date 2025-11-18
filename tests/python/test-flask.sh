@@ -105,6 +105,7 @@ const server = spawn('node', ['build/index.js'], {
 
 let buffer = '';
 let requestId = 0;
+const pendingRequests = new Map();
 
 server.stdout.on('data', (data) => {
   buffer += data.toString();
@@ -117,8 +118,18 @@ server.stdout.on('data', (data) => {
         const msg = JSON.parse(line);
         if (msg.result) {
           console.log(msg.result.content[0].text);
+          const pending = pendingRequests.get(msg.id);
+          if (pending) {
+            pending.resolve(msg.result);
+            pendingRequests.delete(msg.id);
+          }
         } else if (msg.error) {
           console.error('Error:', msg.error);
+          const pending = pendingRequests.get(msg.id);
+          if (pending) {
+            pending.reject(new Error(msg.error.message));
+            pendingRequests.delete(msg.id);
+          }
         }
       } catch (e) {}
     }
@@ -126,15 +137,23 @@ server.stdout.on('data', (data) => {
 });
 
 function sendRequest(method, params) {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const request = {
       jsonrpc: '2.0',
       id: ++requestId,
       method: method,
       params: params
     };
+    pendingRequests.set(request.id, { resolve, reject });
     server.stdin.write(JSON.stringify(request) + '\n');
-    setTimeout(resolve, 500);
+    
+    // Timeout after 120 seconds for long operations
+    setTimeout(() => {
+      if (pendingRequests.has(request.id)) {
+        pendingRequests.delete(request.id);
+        reject(new Error('Request timeout'));
+      }
+    }, 120000);
   });
 }
 
@@ -146,28 +165,24 @@ async function runTests() {
     name: 'build_graph_index',
     arguments: { database_name: dbName }
   });
-  await new Promise(r => setTimeout(r, 20000));
   
   console.log('\n📈 Test 2/6: Getting database statistics...\n');
   await sendRequest('tools/call', {
     name: 'get_graph_stats',
     arguments: { database_name: dbName }
   });
-  await new Promise(r => setTimeout(r, 2000));
   
   console.log('\n🔍 Test 3/6: Finding functions matching "request"...\n');
   await sendRequest('tools/call', {
     name: 'find_function_graph',
     arguments: { database_name: dbName, function_name: 'request', limit: 10 }
   });
-  await new Promise(r => setTimeout(r, 2000));
   
   console.log('\n📞 Test 4/6: Finding callers of "make_response"...\n');
   await sendRequest('tools/call', {
     name: 'find_callers_graph',
     arguments: { database_name: dbName, function_name: 'make_response' }
   });
-  await new Promise(r => setTimeout(r, 2000));
   
   console.log('\n🎯 Test 5/6: Finding call chain from "__init__" to "run"...\n');
   await sendRequest('tools/call', {
@@ -179,7 +194,6 @@ async function runTests() {
       max_depth: 5
     }
   });
-  await new Promise(r => setTimeout(r, 2000));
   
   console.log('\n🏛️ Test 6/6: Finding functions with "app" in the name...\n');
   await sendRequest('tools/call', {
@@ -190,7 +204,6 @@ async function runTests() {
       limit: 15
     }
   });
-  await new Promise(r => setTimeout(r, 2000));
   
   server.kill();
 }

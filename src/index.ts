@@ -1429,11 +1429,11 @@ select m, m.getName() as name, m.getFile().getRelativePath() as file,
               console.error(`WARNING: Mismatch! flatValues.length=${flatValues.length}, expected=${expectedParams}`);
             }
             
-            await postgres.executeQuery(
+            const result = await postgres.executeQuery(
               `INSERT INTO ${table} (${actualColumns.join(", ")}) VALUES ${placeholders}`,
               flatValues
             );
-            console.error(`  ✓ Batch ${Math.floor(i/batchSize) + 1}/${Math.ceil(values.length/batchSize)}: ${batch.length} rows, ${flatValues.length} params`);
+            console.error(`  ✓ Batch ${Math.floor(i/batchSize) + 1}/${Math.ceil(values.length/batchSize)}: ${batch.length} rows inserted`);
           }
         }
 
